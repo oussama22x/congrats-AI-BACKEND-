@@ -5,9 +5,7 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
-const speech = require('@google-cloud/speech');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const fs = require('fs');
 
 // Initialize Gemini AI client
 let genAI = null;
@@ -15,30 +13,9 @@ if (process.env.GEMINI_API_KEY) {
   genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
   console.log('✨ Gemini AI client initialized');
 } else {
-  console.warn('⚠️  GEMINI_API_KEY not found in .env file');
-  console.warn('   Gemini transcription will be disabled');
-}
-
-// Initialize Google Speech-to-Text client (optional)
-let speechClient = null;
-const googleCredPath = process.env.GOOGLE_APPLICATION_CREDENTIALS || './google-credentials.json';
-
-if (fs.existsSync(googleCredPath)) {
-  try {
-    speechClient = new speech.SpeechClient({
-      keyFilename: googleCredPath
-    });
-    console.log('🎤 Google Speech-to-Text client initialized');
-  } catch (error) {
-    console.warn('⚠️  Failed to initialize Google Speech-to-Text client:', error.message);
-    console.warn('   Transcription will be disabled');
-  }
-} else {
-  console.warn('⚠️  Google credentials file not found at:', googleCredPath);
-  console.warn('   Transcription will be disabled. To enable:');
-  console.warn('   1. Get credentials from Google Cloud Console');
-  console.warn('   2. Save as google-credentials.json in backend folder');
-  console.warn('   3. Or set GOOGLE_APPLICATION_CREDENTIALS env var');
+  console.error('❌ ERROR: GEMINI_API_KEY not found in .env file');
+  console.error('   Gemini transcription will not work without it.');
+  process.exit(1);
 }
 
 // Initialize Supabase client (shared instance)
@@ -239,6 +216,42 @@ app.get('/api/opportunities', async (req, res) => {
   }
 });
 
+// --- Demo Interview Endpoint: Return 3 Simple Test Questions ---
+app.get('/api/audition/demo', async (req, res) => {
+  try {
+    console.log('🎬 Returning demo interview questions');
+    
+    const demoQuestions = [
+      {
+        id: 'D1',
+        question_text: 'Tell us about yourself.',
+        time_limit_seconds: 90
+      },
+      {
+        id: 'D2',
+        question_text: 'Why are you interested in this opportunity?',
+        time_limit_seconds: 90
+      },
+      {
+        id: 'D3',
+        question_text: 'What are your greatest strengths?',
+        time_limit_seconds: 90
+      }
+    ];
+    
+    res.json({
+      success: true,
+      questions: demoQuestions
+    });
+  } catch (error) {
+    console.error('❌ Error in /api/audition/demo:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch demo questions'
+    });
+  }
+});
+
 // --- Endpoint 2: Start Audition (Fetch Questions & Create Submission) ---
 app.post('/api/audition/start', async (req, res) => {
   try {
@@ -358,6 +371,25 @@ app.post('/api/audition/submit-answer', upload.single('audio_file'), async (req,
     console.log(`  └─ Question: ${questionId}`);
     console.log(`  └─ Question Text: ${questionText}`);
 
+    // Check if this is a demo submission
+    const isDemoMode = opportunityId === 'demo' || userId === 'demo-user';
+    
+    if (isDemoMode) {
+      console.log('🎬 Demo mode detected - skipping database operations');
+      
+      // For demo, just return success without saving anything
+      return res.status(200).json({
+        success: true,
+        message: 'Demo answer received (not saved)',
+        data: {
+          answerId: 'demo-answer-' + Date.now(),
+          audioUrl: 'demo-url',
+          transcript: '[Demo mode - transcription skipped]',
+          questionId: questionId
+        }
+      });
+    }
+
     // Validate required fields
     if (!opportunityId || !userId || !questionId || !questionText) {
       return res.status(400).json({
@@ -404,42 +436,52 @@ app.post('/api/audition/submit-answer', upload.single('audio_file'), async (req,
 
     const audio_url = publicUrl; // Store for clarity
 
-    // C. Transcribe Audio with Gemini AI (New URI Method)
-    let transcript = null; // Default to null in case of error
-    
-    if (genAI) {
-      console.log('🎤 Starting transcription with Gemini (URI method)...');
+    // --- 2. TRANSCRIBE AUDIO (New Gemini Buffer Method) ---
+    console.log("🎤 Starting transcription with Gemini (Buffer method)...");
+    let transcript = null; 
+
+    try {
+      // Use Gemini 2.0 Flash (latest stable model that supports audio)
+      const model = genAI.getGenerativeModel({ 
+        model: "gemini-2.0-flash"
+      });
+
+      // Convert the file buffer to the Base64 format Gemini needs
+      const base64Audio = req.file.buffer.toString("base64");
+      const audioPart = {
+        inlineData: {
+          data: base64Audio,
+          mimeType: req.file.mimetype // e.g., 'audio/webm'
+        }
+      };
+
+      const prompt = "Transcribe this audio file. Return only the spoken text, nothing else.";
+      const result = await model.generateContent([prompt, audioPart]);
+      const response = await result.response;
+      transcript = response.text();
+      console.log("✅ Transcription successful:", transcript.substring(0, 100) + "...");
+
+    } catch (transcriptionError) {
+      console.error("--- ❌ GEMINI TRANSCRIPTION FAILED ---");
+      console.error("Error details:", transcriptionError);
       
-      try {
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        
-        // NEW: Use the file URI (Supabase URL) instead of the buffer
-        const audioFile = {
-          fileData: {
-            mimeType: file.mimetype, // e.g., 'audio/webm'
-            fileUri: audio_url         // The public URL from Supabase
-          }
-        };
-
-        const prompt = "Transcribe this audio file. Return only the text.";
-
-        const result = await model.generateContent([prompt, audioFile]);
-        transcript = result.response.text();
-        console.log('✅ Transcription successful.');
-        console.log(`   Preview: "${transcript.substring(0, 100)}${transcript.length > 100 ? '...' : ''}"`);
-
-      } catch (transcriptionError) {
-        console.error('--- GEMINI TRANSCRIPTION FAILED ---');
-        // Log the full, detailed error for debugging
-        console.error(JSON.stringify(transcriptionError, null, 2));
-        console.error('--- END OF ERROR ---');
-        // Soft fail - we will just save 'null'
-        transcript = null;
+      // Log more specific error info
+      if (transcriptionError.status === 404) {
+        console.error("💡 404 Error - Model not found or not supported");
+        console.error("   Current model: gemini-2.0-flash");
+        console.error("   This model should support audio transcription");
+      } else if (transcriptionError.status === 403) {
+        console.error("💡 403 Error - API key may be invalid or region-blocked");
+      } else if (transcriptionError.status === 400) {
+        console.error("💡 400 Error - Audio format may not be supported");
+        console.error("   MIME type:", req.file.mimetype);
       }
-    } else {
-      console.log('⏭️  Skipping transcription (Gemini API key not configured)');
-      transcript = null;
+      
+      console.error(JSON.stringify(transcriptionError, null, 2));
+      console.error("--- END OF ERROR ---");
+      transcript = "[Transcription failed. See backend logs for details.]";
     }
+    // --- End Transcription ---
 
     // D. Save to Database (audition_answers table)
     console.log('💾 Saving answer to database...');
@@ -861,6 +903,7 @@ app.listen(PORT, () => {
   console.log(`✅ Backend server running on port ${PORT}`);
   console.log(`📡 Endpoints available:`);
   console.log(`   GET  /api/opportunities`);
+  console.log(`   GET  /api/audition/demo`);
   console.log(`   POST /api/audition/submit-answer`);
   console.log(`   POST /api/audition/create-submission`);
   console.log(`   POST /api/audition/submit-survey`);
